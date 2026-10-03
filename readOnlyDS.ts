@@ -2,7 +2,7 @@ import { DataSource } from 'typeorm';
 import { config } from 'dotenv';
 
 config({
-  path: [`.env`],
+  path: [`.env`, `.env.readonly`],
 });
 for (const v of [
   'DATABASE_HOST',

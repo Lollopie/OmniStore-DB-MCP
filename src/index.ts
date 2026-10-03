@@ -7,6 +7,7 @@ import { serve } from "@hono/node-server";
 import { columnOutputSchema, getColumns } from "./tools/getColumns";
 import { constraintOutputSchema, getConstraints } from "./tools/getConstraints";
 import { MAX_ROWS, executeReadOnly, executeReadOnlyInputSchema, executeReadOnlyOutputSchema } from "./tools/executeReadOnly";
+import { planMigration, planMigrationInputSchema, planMigrationOutputSchema } from "./tools/planMigration";
 const PORT = 3001; 
 
 function buildServer(): McpServer {
@@ -45,6 +46,18 @@ function buildServer(): McpServer {
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ query, orgId, userId, warehouseId }) => await executeReadOnly(query, orgId, userId, warehouseId)
+  );
+  server.registerTool(
+    "plan_migration",
+    {
+      title: "Creates a migration plan",
+      description:
+        `Runs a migration inside a transaction on a local shadow copy of the OmniStore database, returns the resulting schema diff and rolls back. Never touches the real database. BEGIN/COMMIT, COPY, SET and similar statements are rejected.`,
+      inputSchema: planMigrationInputSchema,
+      outputSchema: planMigrationOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ name, timestamp, sql }) => await planMigration(name, timestamp, sql)
   );
   return server;
 }

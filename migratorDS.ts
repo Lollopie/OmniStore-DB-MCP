@@ -2,7 +2,7 @@ import { DataSource } from 'typeorm';
 import { config } from 'dotenv';
 
 config({
-  path: [`.env`],
+  path: [`.env`, '.env.migrator'],
 });
 for (const v of [
   'DATABASE_HOST',
@@ -22,4 +22,5 @@ export const MigrationDataSource = new DataSource({
   database: process.env.DATABASE_NAME,
   migrations: undefined,
   entities: undefined,
+  ssl: true,
 });

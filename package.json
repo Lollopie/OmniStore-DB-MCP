@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "tsx src/index.ts",
+    "shadow:refresh": "tsx scripts/refreshShadowDb.ts",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "author": "",
@@ -14,6 +15,7 @@
     "@modelcontextprotocol/hono": "^2.0.2",
     "@modelcontextprotocol/server": "^2.3.0",
     "dotenv": "^18.0.5",
+    "libpg-query": "^18.1.5",
     "pg": "^8.23.1",
     "pg-query-stream": "^4.17.1",
     "reflect-metadata": "^0.2.2",
@@ -22,6 +24,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

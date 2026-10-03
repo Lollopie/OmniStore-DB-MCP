@@ -1,0 +1,39 @@
+# Local, throwaway copy of the OmniStore database that plan_migration runs migrations against.
+# Created and refreshed by `npm run shadow:refresh` (scripts/refreshShadowDb.ts), not by hand.
+name: omnistore-shadow
+
+services:
+  db:
+    image: postgres:18-alpine
+    container_name: omnistore-shadow-db
+    environment:
+      # Random per refresh and never stored. The superuser is only reachable through
+      # `docker exec` on the local socket; pg_hba.conf rejects it over TCP.
+      POSTGRES_PASSWORD: ${SHADOW_SUPERUSER_PASSWORD:?run npm run shadow:refresh}
+      POSTGRES_DB: ${SHADOW_DATABASE:?run npm run shadow:refresh}
+    # Only on the internal network: no gateway, so the database can't reach the internet,
+    # the host or any other container.
+    networks: [internal]
+    healthcheck:
+      # Over TCP, because the temporary server during first-time init only listens on the socket
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "postgres"]
+      interval: 1s
+      retries: 30
+
+  # Postgres has no route out, and Docker can't publish ports from an internal network,
+  # so this fixed-command TCP forwarder is the only way in. It listens on localhost only.
+  proxy:
+    image: alpine/socat:latest
+    container_name: omnistore-shadow-proxy
+    command: TCP-LISTEN:5432,fork,reuseaddr TCP:db:5432
+    ports: ["127.0.0.1:${SHADOW_PORT:-5433}:5432"]
+    networks: [internal, published]
+    depends_on:
+      db:
+        condition: service_healthy
+
+networks:
+  internal:
+    internal: true
+  # Exists only so the proxy's port can be published to the host.
+  published: {}
