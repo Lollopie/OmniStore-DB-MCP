@@ -1,6 +1,6 @@
 # OmniStore DB MCP server
 
-An [MCP](https://modelcontextprotocol.io) server that gives AI assistants such as Claude Code read-only access to the OmniStore PostgreSQL database. It can describe the schema and run `SELECT` queries.
+An [MCP](https://modelcontextprotocol.io) server that gives AI assistants such as Claude Code read-only access to the OmniStore PostgreSQL database. It can describe the schema and run `SELECT` queries. It can also dry-run migrations on a local copy and apply them, but only after a human approves each one with an authenticator code.
 
 Queries usually come from an AI model, so the server assumes any query might be wrong or hostile. This README explains the security choices that follow from that: what the server protects against, how each protection works, how to check it, and what is still open.
 
@@ -14,6 +14,8 @@ _Last verified on 2026-10-03 against the Render database (PostgreSQL 18.6)._
 | `get_constraints` | Lists each table's constraints with their full SQL definition. | none |
 | `query_readonly` | Runs one SQL query in a read-only transaction and returns at most 200 rows. | `query`; optional `orgId`, `userId`, `warehouseId` |
 | `plan_migration` | Runs a migration on a local shadow copy of the database, returns the schema diff and rolls back. See [Migration planning](#migration-planning). | `name`, `timestamp`, `sql` |
+| `apply_migration` | Submits a plan for human approval and returns the approval page's URL. Nothing runs until a human approves. See [Migration approval](#migration-approval). | `planId` |
+| `get_migration_status` | Returns a plan's status, for example `pending_approval`, `applied` or `rejected`. | `planId` |
 
 The first three tools connect to the real database as the same low-privilege database role. `get_schema` only lists columns that this role may read, so hidden columns such as `user.password` don't appear at all, and neither does `migrations`. `get_constraints` reads the system catalog and covers every table, so constraint definitions can name hidden columns, but never show their data.
 
@@ -32,20 +34,22 @@ The first three tools connect to the real database as the same low-privilege dat
    READONLY_USER=mcp_readonly
    READONLY_PASSWORD=...
 
-   # .env.migrator — loaded only by migratorDS.ts and scripts/refreshShadowDb.ts, never by the server
+   # .env.migrator — loaded by migratorDS.ts, only when an approved migration runs
    MIGRATOR_USER=...
    MIGRATOR_PASSWORD=...
    ```
-   `.env.shadow` is written by `npm run shadow:refresh`. Don't edit it by hand.
+   `.env.shadow` and `.env.approval` are written by the scripts below. Don't edit them by hand.
 4. Optional, for `plan_migration`: create the shadow database with `npm run shadow:refresh` (needs Docker). Run it again to pick up a newer copy of the database.
-5. Start the server: `npm start`. It listens on `http://127.0.0.1:3001/mcp`.
-6. Claude Code finds the server in `.mcp.json` as `omnistore-db` and asks for approval the first time.
+5. Optional, for `apply_migration`: run `npm run approval:setup` and scan the QR code with an authenticator app (Google Authenticator, Aegis, 1Password, …). It saves the secret only after you enter a valid code. `--force` replaces an existing secret.
+6. Start the server: `npm start`. The MCP endpoint is `http://127.0.0.1:3001/mcp`, and the approval page is at `http://127.0.0.1:3002`.
+7. Claude Code finds the server in `.mcp.json` as `omnistore-db` and asks for approval the first time.
 
 ## Threat model
 
 - **Queries are untrusted.** They are usually written by an AI model, which can make mistakes or be manipulated through prompt injection, for example by text stored in the database that it reads back. Every limit is therefore enforced by the server code or by the database. Nothing relies on the tool descriptions, the `readOnlyHint` annotations or what a query claims to do.
 - **Anything the tool can read can leave the database.** Query results go into the model's context and are sent to the model provider. The database privileges below decide what data can end up there.
 - **The server runs on a developer machine** and should only be reachable from that machine.
+- **Only a human may change the real database.** The model or any local program can submit a migration for approval. Applying it needs a code from the authenticator app, which only the human has.
 
 Out of scope: attackers who already control the machine, the env files or a database admin account.
 
@@ -60,7 +64,8 @@ Out of scope: attackers who already control the machine, the env files or a data
 | Reading secrets or personal data | Column-level grants hide passwords, email addresses, invite token hashes, contact messages and Stripe IDs | database role |
 | SQL injection through `orgId`, `userId` or `warehouseId` | Validated as UUID v7, then passed as bound parameters | [executeReadOnly.ts](src/tools/executeReadOnly.ts) |
 | Calls from other machines or malicious websites | Listens on `127.0.0.1` only; `Host` and `Origin` headers are checked | [index.ts](src/index.ts) |
-| Leaked or intercepted credentials | Env files are git-ignored; the server only loads the read-only credentials; database connections use TLS with certificate checks | [.gitignore](.gitignore), [readOnlyDS.ts](readOnlyDS.ts) |
+| Leaked or intercepted credentials | Env files are git-ignored; the migrator credentials are only loaded when an approved migration runs; database connections use TLS with certificate checks | [.gitignore](.gitignore), [readOnlyDS.ts](readOnlyDS.ts), [migratorDS.ts](migratorDS.ts) |
+| Changing the schema without a human | Migrations run only after a valid authenticator code on a separate page, which shows the exact SQL; codes can't be reused or guessed | [src/approval/](src/approval/), [applyMigration.ts](src/tools/applyMigration.ts) |
 
 Row-level security also limits a query to one organization, user or warehouse, but it is **not** access control. See [Row-level security](#row-level-security).
 
@@ -180,6 +185,26 @@ Without the IDs a table needs, a query returns no rows rather than failing.
 
 Copied data: everything the migrator can read with row-level security on. It owns every table, so only tables with **forced** row-level security (currently `contact`) come out empty.
 
+### Migration approval
+
+`apply_migration` doesn't run anything. It moves a plan to `pending_approval` and returns a link to the approval page. The model passes it on to the human and checks the outcome with `get_migration_status`.
+
+- **The page** ([server.ts](src/approval/server.ts)) runs in the same process on `127.0.0.1:3002`. It shows the target database, the SQL highlighted on the server with `highlight.js`, the shadow diff, how old the shadow copy is and when the plan expires. The page has no JavaScript and loads nothing from other origins, so no script can change the SQL it shows.
+- **Approving** needs a 6-digit code from the authenticator app ([totp.ts](src/approval/totp.ts): SHA-1, 30-second steps, one step of clock drift allowed). Rejecting doesn't need a code.
+- **The SQL that runs is the SQL that was shown.** The plan ID is `sha256(name|timestamp|sql)`. Before running, `executeMigration` recomputes it from the stored plan and compares it with the plan ID and with the ID the page submitted. On a mismatch, nothing runs.
+- **Codes and links are single-use.**
+  - Each 30-second step can approve at most once, so an observed code can't be replayed.
+  - The approval link is a random 32-byte token. It stops working once the plan is applied, rejected or expired.
+- **Guessing limits.**
+  - A plan is rejected after 3 wrong codes.
+  - After 5 wrong codes in a row across all plans, approvals lock for 15 minutes. Without this, a caller could keep creating plans and guessing.
+- **Expiry.** A plan must be approved within 30 minutes of `plan_migration`.
+- **Running.** The migration runs as the migrator in one transaction, under an advisory lock and with a 60-second `statement_timeout` and a 10-second `lock_timeout`. The duplicate and timestamp checks run again against the real database inside that transaction.
+- **Page hardening.**
+  - `Host` must be `127.0.0.1:3002` or `localhost:3002`.
+  - A `POST` must come from that origin (CSRF).
+  - The CSP allows only the page's own stylesheet and form target, and the page can't be framed.
+
 ### Network access
 
 The server listens on `127.0.0.1:3001` only, so other machines can't reach it. `createMcpHonoApp()` from the MCP SDK also checks two headers on every request and answers `403` if either check fails:
@@ -193,7 +218,7 @@ If you ever expose the server beyond localhost, add authentication and pass `all
 
 ### Credentials
 
-- Credentials are split by role. The server ([readOnlyDS.ts](readOnlyDS.ts)) loads only `.env` and `.env.readonly`, so the migrator's credentials never reach its process. Only [migratorDS.ts](migratorDS.ts) loads `.env.migrator`.
+- Credentials are split by role. The read-only tools use [readOnlyDS.ts](readOnlyDS.ts), which loads `.env` and `.env.readonly`. [migratorDS.ts](migratorDS.ts) loads `.env.migrator` the first time a migration is submitted or run. Its connection is used only for the duplicate check in `apply_migration` and by `executeMigration`, after a valid authenticator code.
 - `.gitignore` covers `.env` and every `.env.*` file.
 - The server refuses to start if any `READONLY_*` or `DATABASE_*` variable is missing.
 - Both connections use TLS (`ssl: true`). node-postgres hands this to Node's TLS defaults, which verify the server's certificate and hostname. Don't set `NODE_TLS_REJECT_UNAUTHORIZED=0` to get around certificate errors, because that turns the check off.
@@ -244,7 +269,8 @@ curl -s -o /dev/null -w "%{http_code}\n" -H "Origin: https://evil.example" \
 - Pass tool arguments to SQL only as bound parameters (`$1`, `$2`, …), never by building strings.
 - Keep `SET TRANSACTION READ ONLY` and `SET LOCAL statement_timeout` before the query, and the `ROLLBACK` in `finally`.
 - Use `set_config(…, true)` or `SET LOCAL` for per-call settings, never a plain `SET`. Otherwise the setting carries over to the next call on the pooled connection.
-- Don't import `migratorDS.ts` into the server, and don't add `.env.migrator` to the server's `config()` paths. `plan_migration` uses [shadowDS.ts](shadowDS.ts), never the real database.
+- Use `getMigrationDataSource()` only in [applyMigration.ts](src/tools/applyMigration.ts). Never pass a tool argument to it, and never write through it except in `executeMigration`, which only the approval page calls after a valid code. `plan_migration` uses [shadowDS.ts](shadowDS.ts), never the real database.
+- Keep the approval page free of client-side JavaScript and external resources, and keep the plan-hash check in `executeMigration`.
 - Keep `ALLOWED_STATEMENTS` an allowlist. Never add `TransactionStmt`, `CopyStmt`, `VariableSetStmt` or role and extension statements.
 - For a new table, grant `SELECT` explicitly, decide on row-level security, and hide sensitive columns with a column-level grant.
 - For a new `SECURITY DEFINER` function, revoke `EXECUTE` from `PUBLIC`, grant it only to the roles that need it, and set a fixed `search_path` (the existing functions use `pg_catalog, public, pg_temp`).
@@ -271,3 +297,9 @@ These were still open at the last check.
 - **Production data on the developer machine.** The shadow database holds a full copy, including password hashes and email addresses, in a Docker volume. `npm run shadow:refresh` replaces it; `docker compose -f shadow-db/compose.yaml down --volumes` removes it.
 - **Error messages can contain data.** A failed migration returns Postgres's error message to the model. Messages such as constraint violations can name values from the copied rows.
 - **After a refresh, restart the server.** The refresh sets a new password, and pooled connections to the old container fail.
+
+### Migration approval
+
+- **State is in memory.** Restarting the server forgets all plans, pending approvals, used code steps and lockouts.
+- **The authenticator code is the only check.** Anyone at the machine who has the authenticator can approve. The TOTP secret is stored in plain text in `.env.approval`, so anyone who can read that file can generate codes.
+- **The page doesn't show the real database's current state.** The diff comes from the shadow copy, which can be older than the real database.

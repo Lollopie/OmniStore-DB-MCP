@@ -4,22 +4,46 @@ import * as crypto from 'crypto';
 import { QueryRunner } from "typeorm";
 import { parse } from "libpg-query";
 import { columnSchema } from "./getColumns";
-class UserFacingError extends Error {}
+export class UserFacingError extends Error {}
 
-enum PlanStatus {
+export enum PlanStatus {
     planned='planned',
-    executed='executed',
+    pending_approval='pending_approval',
+    applying='applying',
+    applied='applied',
+    failed='failed',
     rejected='rejected',
+    expired='expired',
 }
 
 export interface Plan {
-    id: string, 
-    name: string, 
-    timestamp: string, 
-    sql: string, 
-    diff: string, 
-    createdAt: number, 
-    status: PlanStatus
+    id: string,
+    name: string,
+    timestamp: string,
+    sql: string,
+    diff: string,
+    snapshotTakenAt: string | null,
+    createdAt: number,
+    status: PlanStatus,
+    approvalToken?: string,
+    failedAttempts: number,
+    error?: string,
+}
+
+// A plan has to be approved within this time, counted from when it was planned.
+export const PLAN_TTL_MS = 30 * 60 * 1000;
+
+export function expired(plan: Plan): boolean {
+    return Date.now() - plan.createdAt > PLAN_TTL_MS;
+}
+
+export function expiresAt(plan: Plan): string {
+    return new Date(plan.createdAt + PLAN_TTL_MS).toISOString();
+}
+
+// The plan ID. Recomputed before applying, so the SQL that runs is the SQL that was planned and shown.
+export function planHash(name: string, timestamp: string, sql: string): string {
+    return crypto.createHash('sha256').update(`${name}|${timestamp}|${sql}`).digest('hex');
 }
 
 export const planMigrationInputSchema = z.object({
@@ -32,6 +56,7 @@ export const planMigrationOutputSchema = z.object({
     planId: z.string(),
     diff: z.string(),
     snapshotTakenAt: z.string().nullable().describe('When the shadow copy was taken from the real database'),
+    expiresAt: z.string().describe('apply_migration must be approved before this time'),
 });
 
 interface column {
@@ -48,7 +73,7 @@ interface schemaType {
     }[];
 }
 
-const plans = new Map<string, Plan>();
+export const plans = new Map<string, Plan>();
 
 // Statement types a migration may contain. Everything else, in particular BEGIN/COMMIT/ROLLBACK,
 // COPY, SET, CREATE EXTENSION and role changes, is rejected before anything reaches the database.
@@ -97,9 +122,14 @@ export async function planMigration(name: string, timestamp: string, sql: string
     await recordMigration(qr, name, timestamp);
     const diff = diffSchemas(before, await snapshotSchema(qr));
     const snapshotTakenAt = await getSnapshotTime(qr);
-    const id = crypto.createHash('sha256').update(`${name}|${timestamp}|${sql}`).digest('hex');
-    plans.set(id, { id, name, timestamp, sql, diff, createdAt: Date.now(), status: PlanStatus.planned });
-    const structuredContent = { planId: id, diff, snapshotTakenAt };
+    const id = planHash(name, timestamp, sql);
+    const existing = plans.get(id);
+    if (existing && (existing.status === PlanStatus.applying || (existing.status === PlanStatus.pending_approval && !expired(existing)))) {
+        throw new UserFacingError(`This plan is already ${existing.status}. Check it with get_migration_status.`);
+    }
+    const plan: Plan = { id, name, timestamp, sql, diff, snapshotTakenAt, createdAt: Date.now(), status: PlanStatus.planned, failedAttempts: 0 };
+    plans.set(id, plan);
+    const structuredContent = { planId: id, diff, snapshotTakenAt, expiresAt: expiresAt(plan) };
     return {
         content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }],
         structuredContent,
@@ -110,7 +140,7 @@ export async function planMigration(name: string, timestamp: string, sql: string
   }
 }
 
-async function assertNotApplied(qr: QueryRunner, name: string, timestamp: string) {
+export async function assertNotApplied(qr: QueryRunner, name: string, timestamp: string) {
     const isMigrationInDB = await qr.query('SELECT name FROM migrations WHERE name = $1', [name]);
     const latestTimestamp: { timestamp: string }[] = await qr.query('SELECT timestamp FROM migrations ORDER BY timestamp DESC LIMIT 1');
     if (isMigrationInDB.length > 0) {
@@ -156,7 +186,7 @@ async function snapshotSchema(qr: QueryRunner): Promise<schemaType> {
     return structuredContent;
 }
 
-async function recordMigration(qr: QueryRunner, name: string, timestamp: string) {
+export async function recordMigration(qr: QueryRunner, name: string, timestamp: string) {
     await qr.query('INSERT INTO migrations(timestamp, name) VALUES ($1, $2)', [timestamp, name]);
 }
 

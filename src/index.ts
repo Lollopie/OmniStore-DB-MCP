@@ -8,6 +8,8 @@ import { columnOutputSchema, getColumns } from "./tools/getColumns";
 import { constraintOutputSchema, getConstraints } from "./tools/getConstraints";
 import { MAX_ROWS, executeReadOnly, executeReadOnlyInputSchema, executeReadOnlyOutputSchema } from "./tools/executeReadOnly";
 import { planMigration, planMigrationInputSchema, planMigrationOutputSchema } from "./tools/planMigration";
+import { applyMigration, applyMigrationInputSchema, getMigrationStatus, migrationStatusOutputSchema } from "./tools/applyMigration";
+import { startApprovalServer } from "./approval/server";
 const PORT = 3001; 
 
 function buildServer(): McpServer {
@@ -59,6 +61,30 @@ function buildServer(): McpServer {
     },
     async ({ name, timestamp, sql }) => await planMigration(name, timestamp, sql)
   );
+  server.registerTool(
+    "apply_migration",
+    {
+      title: "Request approval to apply a migration",
+      description:
+        `Submits a plan from plan_migration for human approval and returns an approvalUrl. Nothing runs until a human opens that page, reviews the SQL and enters an authenticator code. Give the URL to the user, then check the outcome with get_migration_status. Plans must be approved within 30 minutes of planning.`,
+      inputSchema: applyMigrationInputSchema,
+      outputSchema: migrationStatusOutputSchema,
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ planId }) => await applyMigration(planId)
+  );
+  server.registerTool(
+    "get_migration_status",
+    {
+      title: "Get migration status",
+      description:
+        `Returns a plan's status: planned, pending_approval, applying, applied, failed, rejected or expired.`,
+      inputSchema: applyMigrationInputSchema,
+      outputSchema: migrationStatusOutputSchema,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+    },
+    async ({ planId }) => getMigrationStatus(planId)
+  );
   return server;
 }
 ReadOnlyDataSource.initialize();
@@ -71,3 +97,4 @@ app.all("/mcp", (c) => mcpHandler.fetch(c.req.raw));
 serve({ fetch: app.fetch, port: PORT, hostname: "127.0.0.1" }, () => {
   console.log(`Streamable HTTP MCP Server listening on http://127.0.0.1:${PORT}/mcp`)
 })
+startApprovalServer();
